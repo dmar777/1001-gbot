@@ -5,7 +5,11 @@
     "moduleResolution": "node",
     "outDir": "dist",
     "strict": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "types": ["node"],
+    "lib": ["ES2022"]
   },
   "include": ["src"]
 }

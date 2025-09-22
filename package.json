@@ -1,12 +1,19 @@
 {
   "name": "galaswap-v3-momentum-bot",
   "version": "1.0.1",
+  "description": "GalaSwap V3 Momentum Bot (TypeScript) para rodar no Railway",
   "type": "module",
   "main": "dist/index.js",
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc",
-    "start": "npm run build && node dist/index.js"
+    "start": "npm run build && node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write src/**/*.ts",
+    "clean": "rm -rf dist"
   },
   "dependencies": {
     "bignumber.js": "^9.1.2",
@@ -16,11 +23,28 @@
     "js-sha3": "^0.9.3",
     "node-fetch": "^3.3.2",
     "uuid": "^9.0.1",
-
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "ts-node": "^10.9.2",
     "@types/node": "^22.5.1",
     "@types/uuid": "^9.0.7",
     "@types/elliptic": "^6.4.18",
     "@types/bn.js": "^5.1.5",
-    "typescript": "^5.6.3"
-  }
+    "eslint": "^8.57.1",
+    "@typescript-eslint/eslint-plugin": "^6.21.0",
+    "@typescript-eslint/parser": "^6.21.0",
+    "prettier": "^3.3.3"
+  },
+  "keywords": [
+    "trading",
+    "bot",
+    "momentum",
+    "gala",
+    "galaswap",
+    "typescript"
+  ],
+  "author": "Seu Nome",
+  "license": "MIT"
 }

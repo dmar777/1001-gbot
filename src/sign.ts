@@ -14,14 +14,14 @@ export function signObject<T extends object>(obj: T, privateKey: string): T & { 
 
   const message = stringify(toSign);
 
-  // js-sha3 (CJS) → usar o método digest e converter para Buffer
+  // js-sha3 (CJS) → usar digest() e converter para Buffer
   const hashArr = keccak256.digest(Buffer.from(message));
   const hash = Buffer.from(hashArr);
 
   const pk = Buffer.from(privateKey.replace(/^0x/, ''), 'hex');
   const signature = ecSecp256k1.sign(hash, pk);
 
-  // normalizar s para low-s
+  // normalizar s para low-s (EIP-2 style)
   if (signature.s.cmp(ecSecp256k1.curve.n.shrn(1)) > 0) {
     const n = ecSecp256k1.curve.n;
     (signature as any).s = new BN(n).sub(signature.s);

@@ -4,7 +4,7 @@ import { v4 as uuidv4 } from 'uuid';
 import BigNumber from 'bignumber.js';
 import { signObject } from './sign.js';
 
-// ===== CONFIG =====
+// ===== ENV / CONFIG =====
 const DEX_BASE_URL = process.env.DEX_BASE_URL || 'https://dex-backend-prod1.defi.gala.com';
 const WALLET_ADDRESS = mustEnv('WALLET_ADDRESS');
 const PRIVATE_KEY = mustEnv('PRIVATE_KEY');
@@ -15,7 +15,7 @@ const TRADE_SIZE = new BigNumber(process.env.TRADE_SIZE || '50');
 
 const CHECK_INTERVAL_MS = toNum(process.env.CHECK_INTERVAL_MS, 60000);
 const MOVE_THRESHOLD_PCT = new BigNumber(process.env.MOVE_THRESHOLD_PCT || '2');
-const BTC_PRICE_SOURCE = (process.env.BTC_PRICE_SOURCE || 'coingecko').toLowerCase() as 'coingecko' | 'coinmarketcap';
+const BTC_PRICE_SOURCE = (process.env.BTC_PRICE_SOURCE || 'coingecko').toLowerCase() as 'coingecko'|'coinmarketcap';
 const CMC_API_KEY = process.env.CMC_API_KEY || '';
 
 const TEST_FIRE = (process.env.TEST_FIRE || 'NO').toUpperCase() === 'YES';
@@ -41,10 +41,10 @@ function toNum(v: string | undefined, def: number) {
   return Number.isFinite(n) && n > 0 ? n : def;
 }
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-const compKey = (sym: string) => `${sym}$Unit$none$none`; // chave composta usada nos endpoints da GalaSwap V3
+const compKey = (sym: string) => `${sym}$Unit$none$none`;
 const feeTiers = [500, 3000, 10000] as const;
 
-// ===== Tipos =====
+// ===== Types =====
 type QuoteResp = {
   status: number; error: boolean; message: string;
   data?: { currentSqrtPrice: string; newSqrtPrice: string; fee: number; amountIn?: string; amountOut?: string; }
@@ -52,7 +52,7 @@ type QuoteResp = {
 type SwapPayloadResp = { status: number; error: boolean; message: string; data?: any; };
 type BundleResp = { status: number; error: boolean; message: string; data?: { data: string; message: string; error: boolean; } };
 
-// ===== BTC buffer 1h =====
+// ===== BTC 1h buffer =====
 const buf: Array<{ t: number; p: BigNumber }> = [];
 function pushPrice(p: BigNumber) {
   const now = Date.now();
@@ -75,12 +75,12 @@ async function fetchBtcUsd(): Promise<BigNumber> {
       headers: { 'X-CMC_PRO_API_KEY': CMC_API_KEY }
     });
     if (!r.ok) throw new Error(`CoinMarketCap ${r.status}`);
-    const j: any = await r.json();
+    const j = (await r.json()) as unknown as any;
     return new BigNumber(j.data.BTC.quote.USD.price);
   } else {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
     if (!r.ok) throw new Error(`CoinGecko ${r.status}`);
-    const j: any = await r.json();
+    const j = (await r.json()) as unknown as any;
     return new BigNumber(j.bitcoin.usd);
   }
 }
@@ -98,7 +98,7 @@ async function bestQuoteForAmountIn(tokenIn: string, tokenOut: string, amountIn:
 
     const res = await fetch(url.toString());
     if (!res.ok) continue;
-    const q: QuoteResp = await res.json();
+    const q = (await res.json()) as unknown as QuoteResp;
     const out = q?.data?.amountOut ? new BigNumber(q.data.amountOut) : null;
     if (out && (!best || out.gt(best.amountOut))) {
       best = { fee, amountOut: out, amountIn };
@@ -117,7 +117,7 @@ async function createSwapPayload(params: {
     body: JSON.stringify(params)
   });
   if (!r.ok) throw new Error(`swap payload ${r.status}`);
-  const j: SwapPayloadResp = await r.json();
+  const j = (await r.json()) as unknown as SwapPayloadResp;
   if (j.error || !j.data) throw new Error(`swap payload: ${j.message}`);
   return j.data;
 }
@@ -143,22 +143,21 @@ async function submitBundle(payload: any, type: 'swap'|'addLiquidity'|'removeLiq
     const t = await r.text();
     throw new Error(`bundle ${r.status}: ${t}`);
   }
-  const j: BundleResp = await r.json();
+  const j = (await r.json()) as unknown as BundleResp;
   if (j.error) throw new Error(`bundle error: ${j.message}`);
-  return j.data?.data; // retorna transaction id
+  return j.data?.data;
 }
 
-// ===== Estratégia: momentum no BTC → compra/vende GALA =====
+// ===== Strategy: BTC momentum → buy/sell GALA =====
 async function maybeTrade(changePct: BigNumber) {
   const base = compKey(BASE_SYMBOL);
   const gala = compKey(TARGET_SYMBOL);
 
   if (changePct.gte(MOVE_THRESHOLD_PCT)) {
-    // BUY GALA (tokenIn = BASE, tokenOut = GALA)
     log('info', `[signal] BTC +${changePct.toFixed(2)}% em 1h → BUY ${TARGET_SYMBOL}`);
     const best = await bestQuoteForAmountIn(base, gala, TRADE_SIZE);
     if (!best) return log('warn', 'Nenhuma quote disponível nas 3 fees.');
-    const minOut = best.amountOut.multipliedBy(0.98); // 2% slippage
+    const minOut = best.amountOut.multipliedBy(0.98);
     const payload = await createSwapPayload({
       tokenIn: base, tokenOut: gala, amountIn: TRADE_SIZE.toString(), fee: best.fee,
       amountOutMinimum: minOut.toString()
@@ -166,9 +165,8 @@ async function maybeTrade(changePct: BigNumber) {
     const txId = await submitBundle(payload, 'swap');
     log('info', `Swap enviado (BUY) → txId: ${txId}`);
   } else if (changePct.lte(MOVE_THRESHOLD_PCT.negated())) {
-    // SELL GALA (tokenIn = GALA, tokenOut = BASE)
     log('info', `[signal] BTC ${changePct.toFixed(2)}% em 1h → SELL ${TARGET_SYMBOL}`);
-    const best = await bestQuoteForAmountIn(compKey(TARGET_SYMBOL), compKey(BASE_SYMBOL), TRADE_SIZE);
+    const best = await bestQuoteForAmountIn(gala, base, TRADE_SIZE);
     if (!best) return log('warn', 'Nenhuma quote disponível nas 3 fees.');
     const minOut = best.amountOut.multipliedBy(0.98);
     const payload = await createSwapPayload({
@@ -180,7 +178,7 @@ async function maybeTrade(changePct: BigNumber) {
   }
 }
 
-// ===== Modo de teste: venda periódica de GALA =====
+// ===== Test mode: periodic GALA sell =====
 async function fireTestSell() {
   const gala = compKey(TARGET_SYMBOL);
   const base = compKey(BASE_SYMBOL);
@@ -197,7 +195,7 @@ async function fireTestSell() {
   log('info', `[test] swap enviado → txId: ${txId}`);
 }
 
-// ===== MAIN LOOP =====
+// ===== MAIN =====
 async function main() {
   log('info', 'GalaSwap V3 Momentum Bot iniciado');
   log('info', `Base=${BASE_SYMBOL} | Target=${TARGET_SYMBOL} | TradeSize=${TRADE_SIZE.toString()} | Threshold=${MOVE_THRESHOLD_PCT.toString()}%`);

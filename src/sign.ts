@@ -1,10 +1,8 @@
 import stringify from 'json-stringify-deterministic';
-import ellipticPkg from 'elliptic';
-import jsSha3Pkg from 'js-sha3';
+import { ec as EC } from 'elliptic';
+import { keccak256 } from 'js-sha3';
 import BN from 'bn.js';
 
-const { keccak256 } = jsSha3Pkg;
-const { ec: EC } = ellipticPkg;
 const ecSecp256k1 = new EC('secp256k1');
 
 export function signObject<T extends object>(obj: T, privateKey: string): T & { signature: string } {

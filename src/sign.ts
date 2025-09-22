@@ -1,8 +1,9 @@
 import stringify from 'json-stringify-deterministic';
-import { ec as EC } from 'elliptic';
+import elliptic from 'elliptic';          // ⬅️ default import (CJS)
 import { keccak256 } from 'js-sha3';
 import BN from 'bn.js';
 
+const EC = elliptic.ec;                   // ⬅️ pega o construtor ec do default
 const ecSecp256k1 = new EC('secp256k1');
 
 export function signObject<T extends object>(obj: T, privateKey: string): T & { signature: string } {
@@ -15,7 +16,7 @@ export function signObject<T extends object>(obj: T, privateKey: string): T & { 
 
   const signature = ecSecp256k1.sign(hash, pk);
 
-  // normalizar s para low-s
+  // normalizar s (low-s)
   if (signature.s.cmp(ecSecp256k1.curve.n.shrn(1)) > 0) {
     const n = ecSecp256k1.curve.n;
     (signature as any).s = new BN(n).sub(signature.s);

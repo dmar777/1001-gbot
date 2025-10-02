@@ -1,24 +1,22 @@
 import BigNumber from 'bignumber.js';
 import { GSwap } from '@gala-chain/gswap-sdk';
+import { FeeTier, Opportunity } from './types.js';
 
-type FeeTier = 500 | 3000 | 10000;
 type QuoteResult = { ok: true; fee: FeeTier; out: BigNumber } | { ok: false; error: string };
 
 export type ArbScannerConfig = {
   enabled: boolean;
   intervalMs: number;
-  probeUsd: BigNumber;           // valor de entrada em "moeda base" (p.ex. GUSDC ~ USD)
+  probeUsd: BigNumber;           // valor de entrada (GUSDC ~ USD)
   maxHops: 2 | 3;
   feeTiers: FeeTier[];
-  minProfitBps: number;          // lucro mínimo p/ logar (em bps)
-  slippagePct: number;           // apenas para report (proteção conceitual)
-  tokens: string[];              // símbolos como "GUSDC","GALA","GWETH"
+  minProfitBps: number;          // bps → 10 = 0,10%
+  slippagePct: number;           // apenas p/ logs
+  tokens: string[];
   baseSymbol: string;            // ex.: "GUSDC"
   logLevel: 'debug'|'info'|'warn'|'error';
-
-  // novos controles de logging
-  logSearchedPairs: boolean;     // se true, imprime pares pesquisados
-  logSearchedMax: number;        // limite de linhas no resumo
+  logSearchedPairs: boolean;
+  logSearchedMax: number;
 };
 
 const order = ['debug','info','warn','error'] as const;
@@ -29,18 +27,10 @@ function log(level: 'debug'|'info'|'warn'|'error', msg: string, current: 'debug'
 
 const toKey = (sym: string) => `${sym}|Unit|none|none`;
 
-// --- estruturas de rastreio dos pares pesquisados ---
-type PairStats = {
-  attempted: Set<FeeTier>;   // fees tentadas
-  okFees: Set<FeeTier>;      // fees com quote OK
-  errors: number;            // contagem de falhas
-};
+// ---- rastreio de pares pesquisados (para logs) ----
+type PairStats = { attempted: Set<FeeTier>; okFees: Set<FeeTier>; errors: number; };
 function pairKey(a: string, b: string) { return `${a}->${b}`; }
 
-/**
- * Quota amountIn exato e tenta em uma fee específica.
- * Atualiza as estatísticas de pares pesquisados.
- */
 async function quoteExactIn(
   gswap: GSwap,
   tokenInKey: string,
@@ -59,7 +49,8 @@ async function quoteExactIn(
       (pairStatsMap.get(pkey) as PairStats).attempted.add(fee);
       q = await anyQ.quoteExactInput(tokenInKey, tokenOutKey, amountIn.toString(), fee);
       (pairStatsMap.get(pkey) as PairStats).okFees.add(fee);
-      return { ok: true, fee, out: new BigNumber(q.outTokenAmount?.toString?.() ?? q.outTokenAmount) };
+      const out = new BigNumber(q.outTokenAmount?.toString?.() ?? q.outTokenAmount);
+      return { ok: true, fee, out };
     } else {
       q = await anyQ.quoteExactInput(tokenInKey, tokenOutKey, amountIn.toString());
       const out = new BigNumber(q.outTokenAmount?.toString?.() ?? q.outTokenAmount);
@@ -86,42 +77,32 @@ export class ArbitrageScanner {
     this.cfg = cfg;
   }
 
-  /**
-   * Executa um ciclo de varredura e LOGA as melhores oportunidades + pares pesquisados.
-   * Não envia transações.
-   */
-  async scanOnce(): Promise<void> {
+  /** Varre e RETORNA oportunidades (também loga). Não envia transações. */
+  async scanOnce(): Promise<Opportunity[]> {
+    const opps: Opportunity[] = [];
     if (!this.cfg.enabled) {
       log('info', '[ARB] scanner desligado (ARB_SCAN_ENABLED=NO)', this.cfg.logLevel);
-      return;
+      return opps;
     }
 
     const { tokens, feeTiers, baseSymbol, probeUsd, maxHops } = this.cfg;
-    const baseKey = toKey(baseSymbol);
-
     const start = Date.now();
     let checked = 0;
-    const opps: Array<{ path: string; hops: number; pct: number; inAmt: BigNumber; outAmt: BigNumber; detail: string }> = [];
-
-    // mapa de pares pesquisados na rodada
     const searchedPairs = new Map<string, PairStats>();
 
-    // Rotas de 2 hops (intrapool round-trip) — A -> B -> A com combinação de fees
+    // 2 hops (round-trip A->B->A)
     for (const A of tokens) {
       for (const B of tokens) {
         if (A === B) continue;
-        if (A !== baseSymbol) continue; // começamos/terminamos na base (GUSDC) para valorizar em USD-like
-        const Akey = toKey(A);
-        const Bkey = toKey(B);
+        if (A !== baseSymbol) continue;
+        const Akey = toKey(A), Bkey = toKey(B);
 
         for (const feeAB of feeTiers) {
-          // hop1: A -> B
           const q1 = await quoteExactIn(this.gswap, Akey, Bkey, probeUsd, searchedPairs, feeAB);
           checked++;
           if (!q1.ok) continue;
 
           for (const feeBA of feeTiers) {
-            // hop2: B -> A
             const q2 = await quoteExactIn(this.gswap, Bkey, Akey, q1.out, searchedPairs, feeBA);
             checked++;
             if (!q2.ok) continue;
@@ -130,11 +111,9 @@ export class ArbitrageScanner {
             if (this.isProfitable(pct)) {
               opps.push({
                 path: `${A} (fee=${feeAB}) → ${B} (fee=${feeBA}) → ${A}`,
-                hops: 2,
-                pct,
-                inAmt: probeUsd,
-                outAmt: q2.out,
-                detail: `in=${probeUsd.toFixed(6)} ${A} out=${q2.out.toFixed(6)} ${A}`
+                tokens: [A, B, A],
+                fees: [feeAB, feeBA],
+                hops: 2, pct, inAmt: probeUsd, outAmt: q2.out
               });
             }
           }
@@ -142,38 +121,32 @@ export class ArbitrageScanner {
       }
     }
 
+    // 3 hops (triangular): melhor fee por hop
     if (maxHops >= 3) {
-      // Rotas triangulares A -> B -> C -> A (melhor fee por hop)
       for (const A of tokens) {
         if (A !== baseSymbol) continue;
         for (const B of tokens) {
           if (B === A) continue;
           for (const C of tokens) {
             if (C === A || C === B) continue;
-
             const Akey = toKey(A), Bkey = toKey(B), Ckey = toKey(C);
 
             const q1best = await this.bestFeeOut(Akey, Bkey, probeUsd, searchedPairs);
-            checked += this.cfg.feeTiers.length;
-            if (!q1best) continue;
+            checked += this.cfg.feeTiers.length; if (!q1best) continue;
 
             const q2best = await this.bestFeeOut(Bkey, Ckey, q1best.out, searchedPairs);
-            checked += this.cfg.feeTiers.length;
-            if (!q2best) continue;
+            checked += this.cfg.feeTiers.length; if (!q2best) continue;
 
             const q3best = await this.bestFeeOut(Ckey, Akey, q2best.out, searchedPairs);
-            checked += this.cfg.feeTiers.length;
-            if (!q3best) continue;
+            checked += this.cfg.feeTiers.length; if (!q3best) continue;
 
             const pct = q3best.out.minus(probeUsd).div(probeUsd).multipliedBy(100).toNumber();
             if (this.isProfitable(pct)) {
               opps.push({
                 path: `${A} (fee=${q1best.fee}) → ${B} (fee=${q2best.fee}) → ${C} (fee=${q3best.fee}) → ${A}`,
-                hops: 3,
-                pct,
-                inAmt: probeUsd,
-                outAmt: q3best.out,
-                detail: `in=${probeUsd.toFixed(6)} ${A} out=${q3best.out.toFixed(6)} ${A}`
+                tokens: [A,B,C,A],
+                fees: [q1best.fee, q2best.fee, q3best.fee],
+                hops: 3, pct, inAmt: probeUsd, outAmt: q3best.out
               });
             }
           }
@@ -181,45 +154,33 @@ export class ArbitrageScanner {
       }
     }
 
-    // Ordena e loga top 5
     opps.sort((a, b) => b.pct - a.pct);
-    const top = opps.slice(0, 5);
+
     const elapsed = Date.now() - start;
-
-    log('info', `[ARB] scan concluído em ${elapsed}ms | rotas testadas ~${checked} | oportunidades=${opps.length}`, this.cfg.logLevel);
-    for (const o of top) {
-      const sign = o.pct >= 0 ? '+' : '';
-      log('info', `[ARB] ${sign}${o.pct.toFixed(3)}% | ${o.detail} | path: ${o.path} | hops=${o.hops}`, this.cfg.logLevel);
+    log('info', `[ARB] scan em ${elapsed}ms | rotas≈${checked} | oportunidades=${opps.length}`, this.cfg.logLevel);
+    for (const o of opps.slice(0, 5)) {
+      const s = o.pct >= 0 ? '+' : '';
+      log('info', `[ARB] ${s}${o.pct.toFixed(3)}% | in=${o.inAmt.toFixed(6)} ${this.cfg.baseSymbol} out=${o.outAmt.toFixed(6)} ${this.cfg.baseSymbol} | ${o.path}`, this.cfg.logLevel);
     }
-    if (top.length === 0) {
-      log('info', `[ARB] nada acima de ${this.cfg.minProfitBps} bps nesta rodada`, this.cfg.logLevel);
-    }
+    if (opps.length === 0) log('info', `[ARB] nada ≥ ${this.cfg.minProfitBps} bps`, this.cfg.logLevel);
 
-    // --- resumo dos pares pesquisados (NOVO) ---
     if (this.cfg.logSearchedPairs) {
-      // agregamos por símbolo simples (não a token class com pipe) só para legibilidade
       const pretty = (k: string) => {
-        const [a, b] = k.split('->');
-        const sym = (s: string) => s.split('|')[0]; // "GALA|Unit|none|none" -> "GALA"
-        return `${sym(a)}→${sym(b)}`;
+        const [a,b]=k.split('->'); const sym=(s:string)=>s.split('|')[0]; return `${sym(a)}→${sym(b)}`;
       };
-
-      const lines: string[] = [];
-      for (const [k, st] of searchedPairs.entries()) {
-        const attempted = Array.from(st.attempted).sort((x, y) => x - y).join(',');
-        const ok = Array.from(st.okFees).sort((x, y) => x - y).join(',');
-        const err = st.errors;
-        lines.push(`${pretty(k)} | tried=[${attempted}] ok=[${ok || '-'}] errors=${err}`);
+      const lines:string[]=[];
+      for (const [k,st] of searchedPairs.entries()) {
+        const attempted=[...st.attempted].sort((x,y)=>x-y).join(',');
+        const ok=[...st.okFees].sort((x,y)=>x-y).join(',');
+        lines.push(`${pretty(k)} | tried=[${attempted}] ok=[${ok||'-'}] errors=${st.errors}`);
       }
-
-      lines.sort(); // ordena alfabeticamente
-      const limited = lines.slice(0, this.cfg.logSearchedMax);
+      lines.sort(); const limited=lines.slice(0,this.cfg.logSearchedMax);
       log('info', `[ARB:searched] pares pesquisados (${lines.length}):`, this.cfg.logLevel);
       for (const ln of limited) log('info', `  - ${ln}`, this.cfg.logLevel);
-      if (lines.length > limited.length) {
-        log('info', `  … +${lines.length - limited.length} pares`, this.cfg.logLevel);
-      }
+      if (lines.length>limited.length) log('info', `  … +${lines.length-limited.length} pares`, this.cfg.logLevel);
     }
+
+    return opps;
   }
 
   private async bestFeeOut(

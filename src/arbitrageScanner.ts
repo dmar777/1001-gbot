@@ -7,13 +7,13 @@ type QuoteResult = { ok: true; fee: FeeTier; out: BigNumber } | { ok: false; err
 export type ArbScannerConfig = {
   enabled: boolean;
   intervalMs: number;
-  probeUsd: BigNumber;           // valor de entrada (GUSDC ~ USD)
+  probeUsd: BigNumber;          // valor de entrada em unidades da base do ciclo
   maxHops: 2 | 3;
   feeTiers: FeeTier[];
-  minProfitBps: number;          // bps → 10 = 0,10%
-  slippagePct: number;           // apenas p/ logs
-  tokens: string[];
-  baseSymbol: string;            // ex.: "GUSDC"
+  minProfitBps: number;         // p.ex. 0 para aceitar lucro zero
+  slippagePct: number;          // apenas para logs
+  tokens: string[];             // universo
+  baseSymbols: string[];        // <<< NOVO: bases de partida (ex.: ['GUSDC','GMUSIC'])
   logLevel: 'debug'|'info'|'warn'|'error';
   logSearchedPairs: boolean;
   logSearchedMax: number;
@@ -27,7 +27,6 @@ function log(level: 'debug'|'info'|'warn'|'error', msg: string, current: 'debug'
 
 const toKey = (sym: string) => `${sym}|Unit|none|none`;
 
-// ---- rastreio de pares pesquisados (para logs) ----
 type PairStats = { attempted: Set<FeeTier>; okFees: Set<FeeTier>; errors: number; };
 function pairKey(a: string, b: string) { return `${a}->${b}`; }
 
@@ -77,7 +76,6 @@ export class ArbitrageScanner {
     this.cfg = cfg;
   }
 
-  /** Varre e RETORNA oportunidades (também loga). Não envia transações. */
   async scanOnce(): Promise<Opportunity[]> {
     const opps: Opportunity[] = [];
     if (!this.cfg.enabled) {
@@ -85,17 +83,16 @@ export class ArbitrageScanner {
       return opps;
     }
 
-    const { tokens, feeTiers, baseSymbol, probeUsd, maxHops } = this.cfg;
+    const { tokens, feeTiers, probeUsd, maxHops } = this.cfg;
     const start = Date.now();
     let checked = 0;
     const searchedPairs = new Map<string, PairStats>();
 
-    // 2 hops (round-trip A->B->A)
-    for (const A of tokens) {
+    for (const baseSymbol of this.cfg.baseSymbols) {
+      // 2 hops (round-trip A->B->A)
       for (const B of tokens) {
-        if (A === B) continue;
-        if (A !== baseSymbol) continue;
-        const Akey = toKey(A), Bkey = toKey(B);
+        if (B === baseSymbol) continue;
+        const Akey = toKey(baseSymbol), Bkey = toKey(B);
 
         for (const feeAB of feeTiers) {
           const q1 = await quoteExactIn(this.gswap, Akey, Bkey, probeUsd, searchedPairs, feeAB);
@@ -110,8 +107,8 @@ export class ArbitrageScanner {
             const pct = q2.out.minus(probeUsd).div(probeUsd).multipliedBy(100).toNumber();
             if (this.isProfitable(pct)) {
               opps.push({
-                path: `${A} (fee=${feeAB}) → ${B} (fee=${feeBA}) → ${A}`,
-                tokens: [A, B, A],
+                path: `${baseSymbol} (fee=${feeAB}) → ${B} (fee=${feeBA}) → ${baseSymbol}`,
+                tokens: [baseSymbol, B, baseSymbol],
                 fees: [feeAB, feeBA],
                 hops: 2, pct, inAmt: probeUsd, outAmt: q2.out
               });
@@ -119,17 +116,14 @@ export class ArbitrageScanner {
           }
         }
       }
-    }
 
-    // 3 hops (triangular): melhor fee por hop
-    if (maxHops >= 3) {
-      for (const A of tokens) {
-        if (A !== baseSymbol) continue;
+      // 3 hops (triangular): melhor fee por hop
+      if (maxHops >= 3) {
         for (const B of tokens) {
-          if (B === A) continue;
+          if (B === baseSymbol) continue;
           for (const C of tokens) {
-            if (C === A || C === B) continue;
-            const Akey = toKey(A), Bkey = toKey(B), Ckey = toKey(C);
+            if (C === baseSymbol || C === B) continue;
+            const Akey = toKey(baseSymbol), Bkey = toKey(B), Ckey = toKey(C);
 
             const q1best = await this.bestFeeOut(Akey, Bkey, probeUsd, searchedPairs);
             checked += this.cfg.feeTiers.length; if (!q1best) continue;
@@ -143,8 +137,8 @@ export class ArbitrageScanner {
             const pct = q3best.out.minus(probeUsd).div(probeUsd).multipliedBy(100).toNumber();
             if (this.isProfitable(pct)) {
               opps.push({
-                path: `${A} (fee=${q1best.fee}) → ${B} (fee=${q2best.fee}) → ${C} (fee=${q3best.fee}) → ${A}`,
-                tokens: [A,B,C,A],
+                path: `${baseSymbol} (fee=${q1best.fee}) → ${B} (fee=${q2best.fee}) → ${C} (fee=${q3best.fee}) → ${baseSymbol}`,
+                tokens: [baseSymbol, B, C, baseSymbol],
                 fees: [q1best.fee, q2best.fee, q3best.fee],
                 hops: 3, pct, inAmt: probeUsd, outAmt: q3best.out
               });
@@ -160,14 +154,12 @@ export class ArbitrageScanner {
     log('info', `[ARB] scan em ${elapsed}ms | rotas≈${checked} | oportunidades=${opps.length}`, this.cfg.logLevel);
     for (const o of opps.slice(0, 5)) {
       const s = o.pct >= 0 ? '+' : '';
-      log('info', `[ARB] ${s}${o.pct.toFixed(3)}% | in=${o.inAmt.toFixed(6)} ${this.cfg.baseSymbol} out=${o.outAmt.toFixed(6)} ${this.cfg.baseSymbol} | ${o.path}`, this.cfg.logLevel);
+      log('info', `[ARB] ${s}${o.pct.toFixed(3)}% | in=${o.inAmt.toFixed(6)} out=${o.outAmt.toFixed(6)} | ${o.path}`, this.cfg.logLevel);
     }
     if (opps.length === 0) log('info', `[ARB] nada ≥ ${this.cfg.minProfitBps} bps`, this.cfg.logLevel);
 
     if (this.cfg.logSearchedPairs) {
-      const pretty = (k: string) => {
-        const [a,b]=k.split('->'); const sym=(s:string)=>s.split('|')[0]; return `${sym(a)}→${sym(b)}`;
-      };
+      const pretty = (k: string) => { const [a,b]=k.split('->'); const sym=(s:string)=>s.split('|')[0]; return `${sym(a)}→${sym(b)}`; };
       const lines:string[]=[];
       for (const [k,st] of searchedPairs.entries()) {
         const attempted=[...st.attempted].sort((x,y)=>x-y).join(',');
@@ -199,6 +191,7 @@ export class ArbitrageScanner {
   }
 
   private isProfitable(pct: number): boolean {
+    // aceita zero (ou até negativo, se você setar bps negativos)
     const minPct = this.cfg.minProfitBps / 100; // bps → %
     return pct >= minPct;
   }

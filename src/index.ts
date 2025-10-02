@@ -2,8 +2,9 @@ import 'dotenv/config';
 import BigNumber from 'bignumber.js';
 import { GSwap, PrivateKeySigner, GSwapSDKError } from '@gala-chain/gswap-sdk';
 import { ArbitrageScanner } from './arbitrageScanner.js';
+import { ArbitrageExecutor } from './arbitrageExecutor.js';
+import { Opportunity } from './types.js';
 
-// ===== ENV helpers =====
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase() as 'debug'|'info'|'warn'|'error';
 function log(level: 'debug'|'info'|'warn'|'error', msg: string) {
   const order = ['debug','info','warn','error'] as const;
@@ -13,16 +14,11 @@ function log(level: 'debug'|'info'|'warn'|'error', msg: string) {
 function mustEnv(name: string) { const v = process.env[name]; if (!v) throw new Error(`Missing env: ${name}`); return v; }
 function toNum(v: string | undefined, def: number) { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : def; }
 
-// ===== Wallet / SDK =====
 const WALLET_ADDRESS = mustEnv('WALLET_ADDRESS');
 const PRIVATE_KEY   = mustEnv('PRIVATE_KEY');
+const gswap = new GSwap({ signer: new PrivateKeySigner(PRIVATE_KEY), walletAddress: WALLET_ADDRESS });
 
-const gswap = new GSwap({
-  signer: new PrivateKeySigner(PRIVATE_KEY),
-  walletAddress: WALLET_ADDRESS
-});
-
-// ===== Arbitrage Scanner Config =====
+// Scanner
 const ARB_SCAN_ENABLED       = (process.env.ARB_SCAN_ENABLED || 'YES').toUpperCase() === 'YES';
 const ARB_SCAN_INTERVAL_MS   = toNum(process.env.ARB_SCAN_INTERVAL_MS, 60000);
 const ARB_PROBE_USD          = new BigNumber(process.env.ARB_PROBE_USD || '10');
@@ -30,46 +26,19 @@ const ARB_MAX_HOPS           = Math.max(2, Math.min(3, Number(process.env.ARB_MA
 const ARB_FEE_TIERS          = (process.env.ARB_FEE_TIERS || '500,3000,10000').split(',').map(s => Number(s.trim())) as Array<500|3000|10000>;
 const ARB_MIN_PROFIT_BPS     = Number(process.env.ARB_MIN_PROFIT_BPS || '10');
 const ARB_SLIPPAGE_PCT       = Number(process.env.ARB_SLIPPAGE_PCT || '0.5');
-const ARB_TOKENS_ALLOWLIST   = (process.env.ARB_TOKENS_ALLOWLIST || 'GUSDC,GALA,GWETH,GWBTC').split(',').map(s => s.trim()).filter(Boolean);
-
-// NOVOS controles de log
+const ARB_TOKENS_ALLOWLIST   = (process.env.ARB_TOKENS_ALLOWLIST || 'GUSDC,GALA,GWETH,GWBTC,USDT').split(',').map(s => s.trim()).filter(Boolean);
 const ARB_LOG_SEARCHED_PAIRS = (process.env.ARB_LOG_SEARCHED_PAIRS || 'YES').toUpperCase() === 'YES';
 const ARB_LOG_SEARCHED_MAX   = toNum(process.env.ARB_LOG_SEARCHED_MAX, 50);
+const BASE_SYMBOL            = process.env.BASE_SYMBOL || 'GUSDC';
 
-// Momentum (mantido, mas desligado por padrão aqui)
-const MOMENTUM_ENABLED = (process.env.MOMENTUM_ENABLED || 'NO').toUpperCase() === 'YES';
+// Executor
+const ARB_EXECUTE            = (process.env.ARB_EXECUTE || 'NO').toUpperCase() === 'YES';
+const ARB_TRADE_USD          = new BigNumber(process.env.ARB_TRADE_USD || '10');
+const ARB_MAX_HOPS_EXEC      = Math.max(2, Math.min(3, Number(process.env.ARB_MAX_HOPS_EXEC || '2'))) as 2|3;
+const ARB_MAX_SLIPPAGE_BPS   = Number(process.env.ARB_MAX_SLIPPAGE_BPS || '50');
+const ARB_COOLDOWN_MS        = toNum(process.env.ARB_COOLDOWN_MS, 30000);
+const ARB_DEDUPE_WINDOW_MS   = toNum(process.env.ARB_DEDUPE_WINDOW_MS, 180000);
 
-// Apenas para compatibilidade/registro
-const BASE_SYMBOL   = process.env.BASE_SYMBOL   || 'GUSDC';
-const TARGET_SYMBOL = process.env.TARGET_SYMBOL || 'GALA';
-const TRADE_SIZE    = new BigNumber(process.env.TRADE_SIZE || '100');
-
-// ===== BTC histórico (se usar momentum futuramente) =====
-const CHECK_INTERVAL_MS  = toNum(process.env.CHECK_INTERVAL_MS, 60000);
-const MOVE_THRESHOLD_PCT = new BigNumber(process.env.MOVE_THRESHOLD_PCT || '2');
-const buf: Array<{ t: number; p: BigNumber }> = [];
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-async function fetchBtcUsd(): Promise<BigNumber> {
-  const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
-  if (!r.ok) throw new Error(`CoinGecko ${r.status}`);
-  const j: any = await r.json();
-  return new BigNumber(j.bitcoin.usd);
-}
-function pushPrice(p: BigNumber) {
-  const now = Date.now();
-  buf.push({ t: now, p });
-  const cutoff = now - 60*60*1000; // 1h
-  while (buf.length && buf[0].t < cutoff) buf.shift();
-}
-function pctChange1h(): BigNumber | null {
-  if (buf.length < 2) return null;
-  const first = buf[0].p, last = buf[buf.length - 1].p;
-  if (first.isZero()) return null;
-  return last.minus(first).div(first).multipliedBy(100);
-}
-
-// ===== Arbitrage scanner instance =====
 const scanner = new ArbitrageScanner(gswap, {
   enabled: ARB_SCAN_ENABLED,
   intervalMs: ARB_SCAN_INTERVAL_MS,
@@ -85,42 +54,56 @@ const scanner = new ArbitrageScanner(gswap, {
   logSearchedMax: ARB_LOG_SEARCHED_MAX
 });
 
-async function main() {
-  log('info', `Bot iniciado | Scanner=${ARB_SCAN_ENABLED ? 'ON' : 'OFF'} | Interval=${ARB_SCAN_INTERVAL_MS}ms | Probe=${ARB_PROBE_USD.toFixed()} ${BASE_SYMBOL} | MaxHops=${ARB_MAX_HOPS} | Fees=[${ARB_FEE_TIERS.join(',')}]`);
-  log('info', `Tokens: ${ARB_TOKENS_ALLOWLIST.join(', ')}`);
-  if (!MOMENTUM_ENABLED) log('info', `Momentum: OFF (MOMENTUM_ENABLED=NO)`);
+const executor = new ArbitrageExecutor(gswap, {
+  enabled: ARB_EXECUTE,
+  tradeUsd: ARB_TRADE_USD,
+  maxHopsExec: ARB_MAX_HOPS_EXEC,
+  maxSlippageBps: ARB_MAX_SLIPPAGE_BPS,
+  cooldownMs: ARB_COOLDOWN_MS,
+  dedupeWindowMs: ARB_DEDUPE_WINDOW_MS,
+  baseSymbol: BASE_SYMBOL,
+  logLevel: LOG_LEVEL
+});
 
-  let nextArbAt = Date.now();
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+async function main() {
+  log('info', `Bot iniciado | Scanner=${ARB_SCAN_ENABLED ? 'ON' : 'OFF'} | Execute=${ARB_EXECUTE ? 'ON' : 'OFF'} | Probe=${ARB_PROBE_USD.toFixed()} | Trade=${ARB_TRADE_USD.toFixed()}`, LOG_LEVEL);
+  log('info', `Tokens: ${ARB_TOKENS_ALLOWLIST.join(', ')} | Fees=[${ARB_FEE_TIERS.join(',')}] | MinProfit=${ARB_MIN_PROFIT_BPS}bps`, LOG_LEVEL);
+
+  let nextScanAt = Date.now();
 
   while (true) {
     try {
-      // Momentum (opcional/desligado por padrão)
-      if (MOMENTUM_ENABLED) {
-        const p = await fetchBtcUsd();
-        pushPrice(p);
-        const ch = pctChange1h();
-        if (ch !== null) {
-          log('info', `BTC $${p.toFixed(2)} | Δ1h=${ch.toFixed(2)}% | buffer=${buf.length}`);
-        } else {
-          log('debug', `BTC $${p.toFixed(2)} | coletando histórico... (${buf.length}/~60)`);
+      if (ARB_SCAN_ENABLED && Date.now() >= nextScanAt) {
+        const opps: Opportunity[] = await scanner.scanOnce();
+        nextScanAt = Date.now() + ARB_SCAN_INTERVAL_MS;
+
+        if (ARB_EXECUTE) {
+          // preferência por 3 hops quando permitido; senão 2 hops
+          let candidate: Opportunity | undefined;
+          if (ARB_MAX_HOPS_EXEC === 3) {
+            candidate = opps.find(o => o.hops === 3) ?? opps.find(o => o.hops === 2);
+          } else {
+            candidate = opps.find(o => o.hops === 2);
+          }
+
+          if (candidate) {
+            log('info', `[EXEC] tentando: ${candidate.path} | lucro≈${candidate.pct.toFixed(3)}%`, LOG_LEVEL);
+            await executor.tryExecute(candidate);
+          } else {
+            log('info', `[EXEC] nenhuma oportunidade elegível nesta rodada`, LOG_LEVEL);
+          }
         }
       }
-
-      // Arbitrage scan
-      if (ARB_SCAN_ENABLED && Date.now() >= nextArbAt) {
-        await scanner.scanOnce();
-        nextArbAt = Date.now() + ARB_SCAN_INTERVAL_MS;
-      }
-
     } catch (err: any) {
       if (err?.code || err instanceof GSwapSDKError) {
-        log('error', `[sdk] ${err.code || 'GSWAP_SDK_ERROR'}: ${err.message} ${err.details ? JSON.stringify(err.details) : ''}`);
+        log('error', `[sdk] ${err.code || 'GSWAP_SDK_ERROR'}: ${err.message} ${err.details ? JSON.stringify(err.details) : ''}`, LOG_LEVEL);
       } else {
-        log('error', `[loop] ${err?.message || err}`);
+        log('error', `[loop] ${err?.message || err}`, LOG_LEVEL);
       }
     }
-
-    await sleep(Math.min(CHECK_INTERVAL_MS, 5000));
+    await sleep(1000);
   }
 }
 

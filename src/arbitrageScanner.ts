@@ -15,6 +15,10 @@ export type ArbScannerConfig = {
   tokens: string[];              // símbolos como "GUSDC","GALA","GWETH"
   baseSymbol: string;            // ex.: "GUSDC"
   logLevel: 'debug'|'info'|'warn'|'error';
+
+  // novos controles de logging
+  logSearchedPairs: boolean;     // se true, imprime pares pesquisados
+  logSearchedMax: number;        // limite de linhas no resumo
 };
 
 const order = ['debug','info','warn','error'] as const;
@@ -25,32 +29,50 @@ function log(level: 'debug'|'info'|'warn'|'error', msg: string, current: 'debug'
 
 const toKey = (sym: string) => `${sym}|Unit|none|none`;
 
+// --- estruturas de rastreio dos pares pesquisados ---
+type PairStats = {
+  attempted: Set<FeeTier>;   // fees tentadas
+  okFees: Set<FeeTier>;      // fees com quote OK
+  errors: number;            // contagem de falhas
+};
+function pairKey(a: string, b: string) { return `${a}->${b}`; }
+
 /**
  * Quota amountIn exato e tenta em uma fee específica.
- * Caso a API do SDK não aceite fee fixo, tentamos "sem fee" e aceitamos a melhor, marcando como 0.
+ * Atualiza as estatísticas de pares pesquisados.
  */
 async function quoteExactIn(
   gswap: GSwap,
   tokenInKey: string,
   tokenOutKey: string,
   amountIn: BigNumber,
+  pairStatsMap: Map<string, PairStats>,
   fee?: FeeTier
 ): Promise<QuoteResult> {
+  const pkey = pairKey(tokenInKey, tokenOutKey);
+  if (!pairStatsMap.has(pkey)) pairStatsMap.set(pkey, { attempted: new Set(), okFees: new Set(), errors: 0 });
+
   try {
-    // Algumas versões do SDK aceitam fee diretamente no quoting; se der erro, caímos no fallback.
     const anyQ = (gswap as any).quoting;
     let q: any;
     if (fee) {
+      (pairStatsMap.get(pkey) as PairStats).attempted.add(fee);
       q = await anyQ.quoteExactInput(tokenInKey, tokenOutKey, amountIn.toString(), fee);
+      (pairStatsMap.get(pkey) as PairStats).okFees.add(fee);
       return { ok: true, fee, out: new BigNumber(q.outTokenAmount?.toString?.() ?? q.outTokenAmount) };
     } else {
       q = await anyQ.quoteExactInput(tokenInKey, tokenOutKey, amountIn.toString());
       const out = new BigNumber(q.outTokenAmount?.toString?.() ?? q.outTokenAmount);
-      // se o SDK retornar feeTier na quote, utilizamos; senão marcamos 0 e tratamos adiante
       const feeTier: FeeTier | undefined = q.feeTier ?? undefined;
+      if (feeTier) {
+        (pairStatsMap.get(pkey) as PairStats).attempted.add(feeTier);
+        (pairStatsMap.get(pkey) as PairStats).okFees.add(feeTier);
+      }
       return { ok: true, fee: (feeTier ?? 500) as FeeTier, out };
     }
   } catch (e: any) {
+    if (fee) (pairStatsMap.get(pkey) as PairStats).attempted.add(fee);
+    (pairStatsMap.get(pkey) as PairStats).errors += 1;
     return { ok: false, error: e?.message || String(e) };
   }
 }
@@ -65,7 +87,7 @@ export class ArbitrageScanner {
   }
 
   /**
-   * Executa um ciclo de varredura e LOGA as melhores oportunidades.
+   * Executa um ciclo de varredura e LOGA as melhores oportunidades + pares pesquisados.
    * Não envia transações.
    */
   async scanOnce(): Promise<void> {
@@ -81,23 +103,26 @@ export class ArbitrageScanner {
     let checked = 0;
     const opps: Array<{ path: string; hops: number; pct: number; inAmt: BigNumber; outAmt: BigNumber; detail: string }> = [];
 
+    // mapa de pares pesquisados na rodada
+    const searchedPairs = new Map<string, PairStats>();
+
     // Rotas de 2 hops (intrapool round-trip) — A -> B -> A com combinação de fees
     for (const A of tokens) {
       for (const B of tokens) {
         if (A === B) continue;
-        if (A !== baseSymbol) continue; // por simplicidade, começamos e terminamos na base (GUSDC)
+        if (A !== baseSymbol) continue; // começamos/terminamos na base (GUSDC) para valorizar em USD-like
         const Akey = toKey(A);
         const Bkey = toKey(B);
 
         for (const feeAB of feeTiers) {
           // hop1: A -> B
-          const q1 = await quoteExactIn(this.gswap, Akey, Bkey, probeUsd, feeAB);
+          const q1 = await quoteExactIn(this.gswap, Akey, Bkey, probeUsd, searchedPairs, feeAB);
           checked++;
           if (!q1.ok) continue;
 
           for (const feeBA of feeTiers) {
             // hop2: B -> A
-            const q2 = await quoteExactIn(this.gswap, Bkey, Akey, q1.out, feeBA);
+            const q2 = await quoteExactIn(this.gswap, Bkey, Akey, q1.out, searchedPairs, feeBA);
             checked++;
             if (!q2.ok) continue;
 
@@ -118,7 +143,7 @@ export class ArbitrageScanner {
     }
 
     if (maxHops >= 3) {
-      // Rotas triangulares A -> B -> C -> A, com melhor fee por hop (limitamos a combinatória)
+      // Rotas triangulares A -> B -> C -> A (melhor fee por hop)
       for (const A of tokens) {
         if (A !== baseSymbol) continue;
         for (const B of tokens) {
@@ -128,18 +153,15 @@ export class ArbitrageScanner {
 
             const Akey = toKey(A), Bkey = toKey(B), Ckey = toKey(C);
 
-            // Hop1: A->B (pegar melhor fee entre feeTiers)
-            const q1best = await this.bestFeeOut(Akey, Bkey, probeUsd);
+            const q1best = await this.bestFeeOut(Akey, Bkey, probeUsd, searchedPairs);
             checked += this.cfg.feeTiers.length;
             if (!q1best) continue;
 
-            // Hop2: B->C
-            const q2best = await this.bestFeeOut(Bkey, Ckey, q1best.out);
+            const q2best = await this.bestFeeOut(Bkey, Ckey, q1best.out, searchedPairs);
             checked += this.cfg.feeTiers.length;
             if (!q2best) continue;
 
-            // Hop3: C->A
-            const q3best = await this.bestFeeOut(Ckey, Akey, q2best.out);
+            const q3best = await this.bestFeeOut(Ckey, Akey, q2best.out, searchedPairs);
             checked += this.cfg.feeTiers.length;
             if (!q3best) continue;
 
@@ -169,21 +191,50 @@ export class ArbitrageScanner {
       const sign = o.pct >= 0 ? '+' : '';
       log('info', `[ARB] ${sign}${o.pct.toFixed(3)}% | ${o.detail} | path: ${o.path} | hops=${o.hops}`, this.cfg.logLevel);
     }
-
     if (top.length === 0) {
       log('info', `[ARB] nada acima de ${this.cfg.minProfitBps} bps nesta rodada`, this.cfg.logLevel);
     }
+
+    // --- resumo dos pares pesquisados (NOVO) ---
+    if (this.cfg.logSearchedPairs) {
+      // agregamos por símbolo simples (não a token class com pipe) só para legibilidade
+      const pretty = (k: string) => {
+        const [a, b] = k.split('->');
+        const sym = (s: string) => s.split('|')[0]; // "GALA|Unit|none|none" -> "GALA"
+        return `${sym(a)}→${sym(b)}`;
+      };
+
+      const lines: string[] = [];
+      for (const [k, st] of searchedPairs.entries()) {
+        const attempted = Array.from(st.attempted).sort((x, y) => x - y).join(',');
+        const ok = Array.from(st.okFees).sort((x, y) => x - y).join(',');
+        const err = st.errors;
+        lines.push(`${pretty(k)} | tried=[${attempted}] ok=[${ok || '-'}] errors=${err}`);
+      }
+
+      lines.sort(); // ordena alfabeticamente
+      const limited = lines.slice(0, this.cfg.logSearchedMax);
+      log('info', `[ARB:searched] pares pesquisados (${lines.length}):`, this.cfg.logLevel);
+      for (const ln of limited) log('info', `  - ${ln}`, this.cfg.logLevel);
+      if (lines.length > limited.length) {
+        log('info', `  … +${lines.length - limited.length} pares`, this.cfg.logLevel);
+      }
+    }
   }
 
-  private async bestFeeOut(tokenInKey: string, tokenOutKey: string, amountIn: BigNumber): Promise<{ fee: FeeTier; out: BigNumber } | null> {
+  private async bestFeeOut(
+    tokenInKey: string,
+    tokenOutKey: string,
+    amountIn: BigNumber,
+    searchedPairs: Map<string, PairStats>
+  ): Promise<{ fee: FeeTier; out: BigNumber } | null> {
     let best: { fee: FeeTier; out: BigNumber } | null = null;
     for (const fee of this.cfg.feeTiers) {
-      const q = await quoteExactIn(this.gswap, tokenInKey, tokenOutKey, amountIn, fee);
+      const q = await quoteExactIn(this.gswap, tokenInKey, tokenOutKey, amountIn, searchedPairs, fee);
       if (!q.ok) continue;
       if (!best || q.out.gt(best.out)) best = { fee, out: q.out };
     }
     return best;
-    // se nenhuma fee retornar, devolve null (sem pool/rota disponível)
   }
 
   private isProfitable(pct: number): boolean {

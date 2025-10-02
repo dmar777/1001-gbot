@@ -23,16 +23,20 @@ const gswap = new GSwap({
 });
 
 // ===== Arbitrage Scanner Config =====
-const ARB_SCAN_ENABLED     = (process.env.ARB_SCAN_ENABLED || 'NO').toUpperCase() === 'YES';
-const ARB_SCAN_INTERVAL_MS = toNum(process.env.ARB_SCAN_INTERVAL_MS, 60000);
-const ARB_PROBE_USD        = new BigNumber(process.env.ARB_PROBE_USD || '10');
-const ARB_MAX_HOPS         = Math.max(2, Math.min(3, Number(process.env.ARB_MAX_HOPS || '3'))) as 2|3;
-const ARB_FEE_TIERS        = (process.env.ARB_FEE_TIERS || '500,3000,10000').split(',').map(s => Number(s.trim())) as Array<500|3000|10000>;
-const ARB_MIN_PROFIT_BPS   = Number(process.env.ARB_MIN_PROFIT_BPS || '10');
-const ARB_SLIPPAGE_PCT     = Number(process.env.ARB_SLIPPAGE_PCT || '0.5'); // usado só p/ referência nos logs
-const ARB_TOKENS_ALLOWLIST = (process.env.ARB_TOKENS_ALLOWLIST || 'GUSDC,GALA,GWETH,GWBTC').split(',').map(s => s.trim()).filter(Boolean);
+const ARB_SCAN_ENABLED       = (process.env.ARB_SCAN_ENABLED || 'YES').toUpperCase() === 'YES';
+const ARB_SCAN_INTERVAL_MS   = toNum(process.env.ARB_SCAN_INTERVAL_MS, 60000);
+const ARB_PROBE_USD          = new BigNumber(process.env.ARB_PROBE_USD || '10');
+const ARB_MAX_HOPS           = Math.max(2, Math.min(3, Number(process.env.ARB_MAX_HOPS || '3'))) as 2|3;
+const ARB_FEE_TIERS          = (process.env.ARB_FEE_TIERS || '500,3000,10000').split(',').map(s => Number(s.trim())) as Array<500|3000|10000>;
+const ARB_MIN_PROFIT_BPS     = Number(process.env.ARB_MIN_PROFIT_BPS || '10');
+const ARB_SLIPPAGE_PCT       = Number(process.env.ARB_SLIPPAGE_PCT || '0.5');
+const ARB_TOKENS_ALLOWLIST   = (process.env.ARB_TOKENS_ALLOWLIST || 'GUSDC,GALA,GWETH,GWBTC').split(',').map(s => s.trim()).filter(Boolean);
 
-// Momentum (mantido, mas desligável)
+// NOVOS controles de log
+const ARB_LOG_SEARCHED_PAIRS = (process.env.ARB_LOG_SEARCHED_PAIRS || 'YES').toUpperCase() === 'YES';
+const ARB_LOG_SEARCHED_MAX   = toNum(process.env.ARB_LOG_SEARCHED_MAX, 50);
+
+// Momentum (mantido, mas desligado por padrão aqui)
 const MOMENTUM_ENABLED = (process.env.MOMENTUM_ENABLED || 'NO').toUpperCase() === 'YES';
 
 // Apenas para compatibilidade/registro
@@ -41,7 +45,7 @@ const TARGET_SYMBOL = process.env.TARGET_SYMBOL || 'GALA';
 const TRADE_SIZE    = new BigNumber(process.env.TRADE_SIZE || '100');
 
 // ===== BTC histórico (se usar momentum futuramente) =====
-const CHECK_INTERVAL_MS = toNum(process.env.CHECK_INTERVAL_MS, 60000);
+const CHECK_INTERVAL_MS  = toNum(process.env.CHECK_INTERVAL_MS, 60000);
 const MOVE_THRESHOLD_PCT = new BigNumber(process.env.MOVE_THRESHOLD_PCT || '2');
 const buf: Array<{ t: number; p: BigNumber }> = [];
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -76,7 +80,9 @@ const scanner = new ArbitrageScanner(gswap, {
   slippagePct: ARB_SLIPPAGE_PCT,
   tokens: ARB_TOKENS_ALLOWLIST,
   baseSymbol: BASE_SYMBOL,
-  logLevel: LOG_LEVEL
+  logLevel: LOG_LEVEL,
+  logSearchedPairs: ARB_LOG_SEARCHED_PAIRS,
+  logSearchedMax: ARB_LOG_SEARCHED_MAX
 });
 
 async function main() {
@@ -84,7 +90,6 @@ async function main() {
   log('info', `Tokens: ${ARB_TOKENS_ALLOWLIST.join(', ')}`);
   if (!MOMENTUM_ENABLED) log('info', `Momentum: OFF (MOMENTUM_ENABLED=NO)`);
 
-  // loop principal
   let nextArbAt = Date.now();
 
   while (true) {
@@ -96,7 +101,6 @@ async function main() {
         const ch = pctChange1h();
         if (ch !== null) {
           log('info', `BTC $${p.toFixed(2)} | Δ1h=${ch.toFixed(2)}% | buffer=${buf.length}`);
-          // (sem execução de trade aqui; mantemos só o monitoramento)
         } else {
           log('debug', `BTC $${p.toFixed(2)} | coletando histórico... (${buf.length}/~60)`);
         }
@@ -116,7 +120,7 @@ async function main() {
       }
     }
 
-    await sleep(Math.min(CHECK_INTERVAL_MS, 5000)); // tick curto para responsividade do loop
+    await sleep(Math.min(CHECK_INTERVAL_MS, 5000));
   }
 }
 

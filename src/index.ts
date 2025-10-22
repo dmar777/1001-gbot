@@ -59,8 +59,7 @@ const scanCfg: ScanCfg = {
 
 const scanner = new ArbitrageScanner(gswap, scanCfg);
 
-/* ------------ heartbeat em tempo real -------------- */
-/** FIX: usar NodeJS.Timeout (não NodeJS.Timer) */
+/* ------------ heartbeat -------------- */
 let hbTimer: NodeJS.Timeout | null = null;
 
 function startHeartbeat() {
@@ -104,7 +103,7 @@ async function main() {
       if (!scanCfg.enabled) { await sleep(INTERVAL_MS); continue; }
 
       startHeartbeat();
-      const opps = await scanner.scanOnce();
+      const opps = await scanner.scanOnce();   // conclui a rodada por completo
       stopHeartbeat();
 
       const enriched: Opportunity[] = opps.map(o => ({

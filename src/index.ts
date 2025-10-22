@@ -12,17 +12,19 @@ const parseList = (v: string) =>
 function bpsToPct(bps: number) {
   return bps / 100;
 }
-
-function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 /* ----------------- env ----------------- */
 const DEX_BASE_URL = env("DEX_BASE_URL", "https://dex-backend-prod1.defi.gala.com");
-const WALLET_ADDRESS = env("WALLET_ADDRESS"); // e.g. "eth|0x...."
 const PRIVATE_KEY = env("PRIVATE_KEY");
 
 const ARB_BASES = parseList(env("ARB_BASES", "GUSDC,GALA"));
-const ARB_TOKENS = parseList(env("ARB_TOKENS_ALLOWLIST", "GUSDC,GALA,GMUSIC,FILM,GWETH,GWBTC,SOL,OSMI"));
-const ARB_FEE_TIERS = parseList(env("ARB_FEE_TIERS", "500,3000,10000")).map(n => Number(n) as FeeTier);
+const ARB_TOKENS = parseList(
+  env("ARB_TOKENS_ALLOWLIST", "GUSDC,GALA,GMUSIC,FILM,GWETH,GWBTC,SOL,OSMI")
+);
+const ARB_FEE_TIERS = parseList(env("ARB_FEE_TIERS", "500,3000,10000"))
+  .map(n => Number(n) as FeeTier);
+
 const ARB_MAX_HOPS = Number(env("ARB_MAX_HOPS", "3")) as 2|3|4|5;
 const ARB_PROBE_USD = new BigNumber(env("ARB_PROBE_USD", "50"));
 const ARB_MIN_PROFIT_BPS = Number(env("ARB_MIN_PROFIT_BPS", "0"));
@@ -40,11 +42,16 @@ function log(l: Lvl, m: string) {
   console.log(`[${new Date().toISOString()}] [${l.toUpperCase()}] ${m}`);
 }
 
-/* ----------------- gswap client ----------------- */
+/* ----------------- gswap client -----------------
+   CORREÇÃO: usar gatewayBaseUrl (não existe 'baseUrl');
+   'walletAddress' não faz parte deste tipo de opções.
+-------------------------------------------------- */
 const gswap = new GSwap({
-  baseUrl: DEX_BASE_URL,
   signer: new PrivateKeySigner(PRIVATE_KEY),
-  walletAddress: WALLET_ADDRESS,
+  gatewayBaseUrl: DEX_BASE_URL,
+  // Se precisar sobrescrever paths:
+  // dexContractBasePath: "/v1/trade",
+  // tokenContractBasePath: "/v1/token",
 });
 
 /* ----------------- scanner ----------------- */
@@ -58,28 +65,27 @@ const scanCfg: ScanCfg = {
   logPairsMax: Number(env("ARB_LOG_SEARCHED_MAX","200")),
   log: (lvl, msg) => log(lvl, msg),
   enabled: env("ARB_SCAN_ENABLED","YES").toUpperCase() === "YES",
-  intervalMs: INTERVAL_MS, // now allowed by ScanCfg
+  intervalMs: INTERVAL_MS,
 };
 
 const scanner = new ArbitrageScanner(gswap, scanCfg);
 
 /* ----------------- main loop ----------------- */
 async function main() {
-  log("info", `Bot started | Scanner=${scanCfg.enabled} | Execute=${ARB_EXECUTE} | Probe=${ARB_PROBE_USD} | Trade=${ARB_TRADE_USD}`);
+  log("info",
+    `Bot started | Scanner=${scanCfg.enabled} | Execute=${ARB_EXECUTE} | Probe=${ARB_PROBE_USD} | Trade=${ARB_TRADE_USD}`
+  );
 
   while (true) {
     try {
-      if (!scanCfg.enabled) {
-        await sleep(INTERVAL_MS);
-        continue;
-      }
+      if (!scanCfg.enabled) { await sleep(INTERVAL_MS); continue; }
 
       const opps = await scanner.scanOnce();
 
-      // compute pct if missing, filter by min bps
+      // garante pct mesmo se vier só profitBps
       const enriched: Opportunity[] = opps.map(o => ({
         ...o,
-        pct: o.pct ?? bpsToPct(o.profitBps ?? 0),
+        pct: o.pct ?? (o.profitBps != null ? o.profitBps / 100 : 0),
       }));
 
       const eligible = enriched
@@ -93,9 +99,12 @@ async function main() {
       }
 
       const candidate = eligible[0];
-      log("info", `[CANDIDATE] ${candidate.path} | profit≈${(candidate.pct ?? bpsToPct(candidate.profitBps ?? 0)).toFixed(2)}% | hops=${candidate.hops}`);
+      const pct = candidate.pct ?? (candidate.profitBps ?? 0) / 100;
+      log("info",
+        `[CANDIDATE] ${candidate.path} | profit≈${pct.toFixed(2)}% | hops=${candidate.hops}`
+      );
 
-      // If you wire an executor, call it here. For now we just loop.
+      // Aqui você chamaria o executor se estiver habilitado.
       await sleep(INTERVAL_MS);
     } catch (err: any) {
       log("error", `loop error: ${err?.message || String(err)}`);

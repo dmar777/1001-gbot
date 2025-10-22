@@ -60,20 +60,21 @@ const scanCfg: ScanCfg = {
 const scanner = new ArbitrageScanner(gswap, scanCfg);
 
 /* ------------ heartbeat em tempo real -------------- */
-let hbTimer: NodeJS.Timer | null = null;
+/** FIX: usar NodeJS.Timeout (não NodeJS.Timer) */
+let hbTimer: NodeJS.Timeout | null = null;
 
 function startHeartbeat() {
   stopHeartbeat();
   hbTimer = setInterval(() => {
     const p = scanner.getProgress();
-    if (!p.startedAt) return; // ainda não começou a rodada
+    if (!p.startedAt) return;
 
     const pct = p.totalQuotesPlanned
       ? (p.quotesRequested / p.totalQuotesPlanned) * 100
       : 0;
 
-    let line = `[HB] scan=${(p.elapsedMs/1000).toFixed(2)}s | progress=${p.quotesRequested.toLocaleString()} / ${p.totalQuotesPlanned.toLocaleString()} quotes (${pct.toFixed(1)}%) | pairsTried=${p.pairsTried.toLocaleString()}`;
-    log("info", line);
+    const head = `[HB] scan=${(p.elapsedMs/1000).toFixed(2)}s | progress=${p.quotesRequested.toLocaleString()} / ${p.totalQuotesPlanned.toLocaleString()} quotes (${pct.toFixed(1)}%) | pairsTried=${p.pairsTried.toLocaleString()}`;
+    log("info", head);
 
     if (STATUS_BREAKDOWN_PER_BASE) {
       const entries = Object.entries(p.perBaseCounts);
@@ -103,10 +104,9 @@ async function main() {
       if (!scanCfg.enabled) { await sleep(INTERVAL_MS); continue; }
 
       startHeartbeat();
-      const opps = await scanner.scanOnce();   // heartbeat roda em paralelo
+      const opps = await scanner.scanOnce();
       stopHeartbeat();
 
-      // garante 'pct' quando só houver profitBps
       const enriched: Opportunity[] = opps.map(o => ({
         ...o,
         pct: o.pct ?? bpsToPct(o.profitBps ?? 0),
@@ -119,7 +119,7 @@ async function main() {
       if (eligible.length) {
         const best = eligible[0];
         log("info", `[CANDIDATE] ${best.path} | profit≈${(best.pct ?? 0).toFixed(2)}% | hops=${best.hops}`);
-        // se quiser executar, chame seu executor aqui
+        // executor opcional aqui
       } else {
         log("info", "[EXEC] nenhuma oportunidade elegível nesta rodada");
       }

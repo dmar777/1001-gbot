@@ -3,14 +3,7 @@ import { GSwap } from "@gala-chain/gswap-sdk";
 import { FeeTier, Opportunity } from "./types.js";
 
 /* -------------------------------------------------------
-   Normalizador universal de tokens
-   Entrada aceita:
-     - "GALA", "GMUSIC"
-     - "$GMUSIC"  -> $GMUSIC$Unit$none$none
-     - "GALA$Unit$none$none", "$GMUSIC$Unit$none$none"
-     - "Token$Unit$WEN$client:...."
-     - PIPE "GALA|Unit|none|none", "Token|Unit|WEN|client:..."
-   Saída: sempre PIPE "Symbol|Unit|Sub|Network"
+   Normalizador universal de tokens -> sempre PIPE
 ---------------------------------------------------------*/
 function toPipeId(input: string): string {
   const trimmed = (input || "").trim();
@@ -36,7 +29,7 @@ function toPipeId(input: string): string {
 }
 
 /* -------------------------------------------------------
-   Tipos públicos de status/progresso
+   Config / Status
 ---------------------------------------------------------*/
 export type ScanCfg = {
   baseSymbols: string[];
@@ -52,15 +45,15 @@ export type ScanCfg = {
 };
 
 export type ScanProgress = {
-  startedAt: number | null;           // epoch ms da varredura em andamento
-  lastUpdateAt: number | null;        // epoch ms do último incremento
-  elapsedMs: number;                  // agora - startedAt
-  pairsTried: number;                 // pares/rotas tentados
-  quotesRequested: number;            // chamadas de quote feitas
-  quotesOk: number;                   // respostas com sucesso
-  quotesErr: number;                  // respostas com erro
-  totalQuotesPlanned: number;         // estimativa total para a rodada (2h+3h)
-  perBaseCounts: Record<string, number>; // quantos pares/rotas por base
+  startedAt: number | null;
+  lastUpdateAt: number | null;
+  elapsedMs: number;
+  pairsTried: number;
+  quotesRequested: number;
+  quotesOk: number;
+  quotesErr: number;
+  totalQuotesPlanned: number;         // AGORA: dinâmico (2 por 2-hop, 3 por 3-hop)
+  perBaseCounts: Record<string, number>;
 };
 
 export class ArbitrageScanner {
@@ -88,7 +81,6 @@ export class ArbitrageScanner {
 
   constructor(private gswap: GSwap, private cfg: ScanCfg) {}
 
-  /** snapshot do progresso atual (para heartbeat externo) */
   getProgress(): ScanProgress {
     if (this.progress.startedAt) {
       this.progress.elapsedMs = Date.now() - this.progress.startedAt;
@@ -96,26 +88,8 @@ export class ArbitrageScanner {
     return { ...this.progress, perBaseCounts: { ...this.progress.perBaseCounts } };
   }
 
-  /** relatório final da última rodada concluída */
   getLastReport() {
     return this.lastReport;
-  }
-
-  /* -------- estimativa de workload (quotes) para a rodada --------
-     Para 2 hops (A->B->A):  pares = B*(U-1)*F^2, quotes = pares*2
-     Para 3 hops (A->B->C->A): rotas = B*(U-1)*(U-2)*F^3, quotes = rotas*3
-     Obs: se maxHops > 3, estimamos apenas até 3 para manter custo finito.
-  -----------------------------------------------------------------*/
-  private estimateTotalQuotes(bases: number, tokens: number, fees: number, maxHops: number) {
-    const twoHopPairs = bases * Math.max(0, tokens - 1) * Math.pow(fees, 2);
-    const twoHopQuotes = twoHopPairs * 2;
-
-    const threeHopRoutes = maxHops >= 3
-      ? bases * Math.max(0, tokens - 1) * Math.max(0, tokens - 2) * Math.pow(fees, 3)
-      : 0;
-    const threeHopQuotes = threeHopRoutes * 3;
-
-    return twoHopQuotes + threeHopQuotes;
   }
 
   async scanOnce(): Promise<Opportunity[]> {
@@ -127,7 +101,7 @@ export class ArbitrageScanner {
     const bases = baseSymbols.map(toPipeId);
     const universe = Array.from(new Set(tokens.map(toPipeId)));
 
-    // zera progresso
+    // Zera progresso e PASSA A CONTAR O TOTAL PLANEJADO DINAMICAMENTE
     this.progress = {
       startedAt: Date.now(),
       lastUpdateAt: Date.now(),
@@ -136,9 +110,7 @@ export class ArbitrageScanner {
       quotesRequested: 0,
       quotesOk: 0,
       quotesErr: 0,
-      totalQuotesPlanned: this.estimateTotalQuotes(
-        bases.length, universe.length, feeTiers.length, maxHops
-      ),
+      totalQuotesPlanned: 0, // será incrementado "on the fly"
       perBaseCounts: {},
     };
 
@@ -159,6 +131,9 @@ export class ArbitrageScanner {
             this.progress.pairsTried++;
             this.progress.perBaseCounts[baseSym]++;
             this.progress.lastUpdateAt = Date.now();
+
+            // PLANEJADO: +2 quotes
+            this.progress.totalQuotesPlanned += 2;
 
             if (logPairs && searched.length < logPairsMax) {
               searched.push(`${A.split("|")[0]}→${B.split("|")[0]}`);
@@ -206,6 +181,9 @@ export class ArbitrageScanner {
                 this.progress.pairsTried++;
                 this.progress.perBaseCounts[baseSym]++;
                 this.progress.lastUpdateAt = Date.now();
+
+                // PLANEJADO: +3 quotes
+                this.progress.totalQuotesPlanned += 3;
 
                 if (logPairs && searched.length < logPairsMax) {
                   searched.push(`${A.split("|")[0]}→${B.split("|")[0]}→${C.split("|")[0]}`);

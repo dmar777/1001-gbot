@@ -1,251 +1,198 @@
-import BigNumber from "bignumber.js";
-import { GSwap } from "@gala-chain/gswap-sdk";
-import { FeeTier, Opportunity } from "./types.js";
+import BigNumber from 'bignumber.js';
+import { GSwap } from '@gala-chain/gswap-sdk';
+import { FeeTier, Opportunity } from './types.js';
 
-/* -------------------------------------------------------
-   Normalizador universal de tokens -> sempre PIPE
----------------------------------------------------------*/
-function toPipeId(input: string): string {
-  const trimmed = (input || "").trim();
-  if (trimmed.includes("|")) return trimmed;
+type QuoteResult = { ok: true; fee: FeeTier; out: BigNumber } | { ok: false; error: string };
 
-  const toDollar = (s: string) => {
-    if (/\$/.test(s)) return s;              // já canônico
-    if (s.startsWith("$")) return `${s}$Unit$none$none`;
-    return `${s}$Unit$none$none`;
-  };
+export type ArbScannerConfig = {
+  enabled: boolean;
+  intervalMs: number;
+  probeUsd: BigNumber;          // valor de entrada em unidades da base do ciclo
+  maxHops: 2 | 3;
+  feeTiers: FeeTier[];
+  minProfitBps: number;         // p.ex. 0 para aceitar lucro zero
+  slippagePct: number;          // apenas para logs
+  tokens: string[];             // universo
+  baseSymbols: string[];        // <<< NOVO: bases de partida (ex.: ['GUSDC','GMUSIC'])
+  logLevel: 'debug'|'info'|'warn'|'error';
+  logSearchedPairs: boolean;
+  logSearchedMax: number;
+};
 
-  const dollar = toDollar(trimmed);
-  const m = dollar.match(
-    /^(\$?[A-Za-z0-9:_-]+)\$(Unit)\$([A-Za-z0-9:_-]+)\$([A-Za-z0-9:_-]+)$/
-  );
-  if (!m) {
-    throw new Error(
-      `Token id inválido: "${input}". Ex.: GALA$Unit$none$none, $GMUSIC$Unit$none$none ou Token$Unit$WEN$client:...`
-    );
-  }
-  const symbol = m[1].startsWith("$") ? m[1].slice(1) : m[1];
-  return `${symbol}|${m[2]}|${m[3]}|${m[4]}`;
+const order = ['debug','info','warn','error'] as const;
+function log(level: 'debug'|'info'|'warn'|'error', msg: string, current: 'debug'|'info'|'warn'|'error') {
+  if (order.indexOf(level) < order.indexOf(current)) return;
+  console.log(`[${new Date().toISOString()}] [${level.toUpperCase()}] ${msg}`);
 }
 
-/* -------------------------------------------------------
-   Config / Status
----------------------------------------------------------*/
-export type ScanCfg = {
-  baseSymbols: string[];
-  tokens: string[];
-  feeTiers: FeeTier[];
-  probeAmount: BigNumber;
-  maxHops: 2 | 3 | 4 | 5;
-  logPairs: boolean;
-  logPairsMax: number;
-  log: (level: "info" | "debug" | "warn" | "error", msg: string) => void;
-  enabled?: boolean;
-  intervalMs?: number;
-};
+const toKey = (sym: string) => `${sym}|Unit|none|none`;
 
-export type ScanProgress = {
-  startedAt: number | null;
-  lastUpdateAt: number | null;
-  elapsedMs: number;
-  pairsTried: number;
-  quotesRequested: number;
-  quotesOk: number;
-  quotesErr: number;
-  totalQuotesPlanned: number;         // AGORA: dinâmico (2 por 2-hop, 3 por 3-hop)
-  perBaseCounts: Record<string, number>;
-};
+type PairStats = { attempted: Set<FeeTier>; okFees: Set<FeeTier>; errors: number; };
+function pairKey(a: string, b: string) { return `${a}->${b}`; }
+
+async function quoteExactIn(
+  gswap: GSwap,
+  tokenInKey: string,
+  tokenOutKey: string,
+  amountIn: BigNumber,
+  pairStatsMap: Map<string, PairStats>,
+  fee?: FeeTier
+): Promise<QuoteResult> {
+  const pkey = pairKey(tokenInKey, tokenOutKey);
+  if (!pairStatsMap.has(pkey)) pairStatsMap.set(pkey, { attempted: new Set(), okFees: new Set(), errors: 0 });
+
+  try {
+    const anyQ = (gswap as any).quoting;
+    let q: any;
+    if (fee) {
+      (pairStatsMap.get(pkey) as PairStats).attempted.add(fee);
+      q = await anyQ.quoteExactInput(tokenInKey, tokenOutKey, amountIn.toString(), fee);
+      (pairStatsMap.get(pkey) as PairStats).okFees.add(fee);
+      const out = new BigNumber(q.outTokenAmount?.toString?.() ?? q.outTokenAmount);
+      return { ok: true, fee, out };
+    } else {
+      q = await anyQ.quoteExactInput(tokenInKey, tokenOutKey, amountIn.toString());
+      const out = new BigNumber(q.outTokenAmount?.toString?.() ?? q.outTokenAmount);
+      const feeTier: FeeTier | undefined = q.feeTier ?? undefined;
+      if (feeTier) {
+        (pairStatsMap.get(pkey) as PairStats).attempted.add(feeTier);
+        (pairStatsMap.get(pkey) as PairStats).okFees.add(feeTier);
+      }
+      return { ok: true, fee: (feeTier ?? 500) as FeeTier, out };
+    }
+  } catch (e: any) {
+    if (fee) (pairStatsMap.get(pkey) as PairStats).attempted.add(fee);
+    (pairStatsMap.get(pkey) as PairStats).errors += 1;
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
 
 export class ArbitrageScanner {
-  private progress: ScanProgress = {
-    startedAt: null,
-    lastUpdateAt: null,
-    elapsedMs: 0,
-    pairsTried: 0,
-    quotesRequested: 0,
-    quotesOk: 0,
-    quotesErr: 0,
-    totalQuotesPlanned: 0,
-    perBaseCounts: {},
-  };
+  private gswap: GSwap;
+  private cfg: ArbScannerConfig;
 
-  private lastReport: {
-    startedAt: number;
-    finishedAt: number;
-    durationMs: number;
-    pairsTried: number;
-    quotesRequested: number;
-    quotesOk: number;
-    quotesErr: number;
-  } | null = null;
-
-  constructor(private gswap: GSwap, private cfg: ScanCfg) {}
-
-  getProgress(): ScanProgress {
-    if (this.progress.startedAt) {
-      this.progress.elapsedMs = Date.now() - this.progress.startedAt;
-    }
-    return { ...this.progress, perBaseCounts: { ...this.progress.perBaseCounts } };
-  }
-
-  getLastReport() {
-    return this.lastReport;
+  constructor(gswap: GSwap, cfg: ArbScannerConfig) {
+    this.gswap = gswap;
+    this.cfg = cfg;
   }
 
   async scanOnce(): Promise<Opportunity[]> {
-    const {
-      baseSymbols, tokens, feeTiers, probeAmount,
-      maxHops, logPairs, logPairsMax, log
-    } = this.cfg;
-
-    const bases = baseSymbols.map(toPipeId);
-    const universe = Array.from(new Set(tokens.map(toPipeId)));
-
-    // Zera progresso e PASSA A CONTAR O TOTAL PLANEJADO DINAMICAMENTE
-    this.progress = {
-      startedAt: Date.now(),
-      lastUpdateAt: Date.now(),
-      elapsedMs: 0,
-      pairsTried: 0,
-      quotesRequested: 0,
-      quotesOk: 0,
-      quotesErr: 0,
-      totalQuotesPlanned: 0, // será incrementado "on the fly"
-      perBaseCounts: {},
-    };
-
-    const startedAt = this.progress.startedAt!;
-    const searched: string[] = [];
     const opps: Opportunity[] = [];
+    if (!this.cfg.enabled) {
+      log('info', '[ARB] scanner desligado (ARB_SCAN_ENABLED=NO)', this.cfg.logLevel);
+      return opps;
+    }
 
-    for (const A of bases) {
-      const baseSym = A.split("|")[0];
-      if (!this.progress.perBaseCounts[baseSym]) this.progress.perBaseCounts[baseSym] = 0;
+    const { tokens, feeTiers, probeUsd, maxHops } = this.cfg;
+    const start = Date.now();
+    let checked = 0;
+    const searchedPairs = new Map<string, PairStats>();
 
-      for (const B of universe) {
-        if (B === A) continue;
+    for (const baseSymbol of this.cfg.baseSymbols) {
+      // 2 hops (round-trip A->B->A)
+      for (const B of tokens) {
+        if (B === baseSymbol) continue;
+        const Akey = toKey(baseSymbol), Bkey = toKey(B);
 
-        // ---------- 2 hops ----------
-        for (const fAB of feeTiers) {
-          for (const fBA of feeTiers) {
-            this.progress.pairsTried++;
-            this.progress.perBaseCounts[baseSym]++;
-            this.progress.lastUpdateAt = Date.now();
+        for (const feeAB of feeTiers) {
+          const q1 = await quoteExactIn(this.gswap, Akey, Bkey, probeUsd, searchedPairs, feeAB);
+          checked++;
+          if (!q1.ok) continue;
 
-            // PLANEJADO: +2 quotes
-            this.progress.totalQuotesPlanned += 2;
+          for (const feeBA of feeTiers) {
+            const q2 = await quoteExactIn(this.gswap, Bkey, Akey, q1.out, searchedPairs, feeBA);
+            checked++;
+            if (!q2.ok) continue;
 
-            if (logPairs && searched.length < logPairsMax) {
-              searched.push(`${A.split("|")[0]}→${B.split("|")[0]}`);
-            }
-
-            try {
-              this.progress.quotesRequested++;
-              const q1: any = await (this.gswap as any).quoting.quoteExactInput(
-                A, B, probeAmount.toString(), fAB
-              );
-              const out1 = new BigNumber(q1?.outTokenAmount?.toString?.() ?? q1?.outTokenAmount ?? "0");
-              this.progress.quotesOk++;
-              if (out1.isZero()) continue;
-
-              this.progress.quotesRequested++;
-              const q2: any = await (this.gswap as any).quoting.quoteExactInput(
-                B, A, out1.toString(), fBA
-              );
-              const out2 = new BigNumber(q2?.outTokenAmount?.toString?.() ?? q2?.outTokenAmount ?? "0");
-              this.progress.quotesOk++;
-
-              const profitBps = out2.minus(probeAmount).div(probeAmount).multipliedBy(10_000).toNumber();
+            const pct = q2.out.minus(probeUsd).div(probeUsd).multipliedBy(100).toNumber();
+            if (this.isProfitable(pct)) {
               opps.push({
-                hops: 2,
-                tokens: [A, B, A],
-                fees: [fAB, fBA],
-                path: `${A.split("|")[0]}->${B.split("|")[0]}->${A.split("|")[0]}`,
-                profitBps,
+                path: `${baseSymbol} (fee=${feeAB}) → ${B} (fee=${feeBA}) → ${baseSymbol}`,
+                tokens: [baseSymbol, B, baseSymbol],
+                fees: [feeAB, feeBA],
+                hops: 2, pct, inAmt: probeUsd, outAmt: q2.out
               });
-            } catch {
-              this.progress.quotesErr++;
             }
           }
         }
+      }
 
-        if (maxHops < 3) continue;
+      // 3 hops (triangular): melhor fee por hop
+      if (maxHops >= 3) {
+        for (const B of tokens) {
+          if (B === baseSymbol) continue;
+          for (const C of tokens) {
+            if (C === baseSymbol || C === B) continue;
+            const Akey = toKey(baseSymbol), Bkey = toKey(B), Ckey = toKey(C);
 
-        // ---------- 3 hops ----------
-        for (const C of universe) {
-          if (C === A || C === B) continue;
+            const q1best = await this.bestFeeOut(Akey, Bkey, probeUsd, searchedPairs);
+            checked += this.cfg.feeTiers.length; if (!q1best) continue;
 
-          for (const fAB of feeTiers)
-            for (const fBC of feeTiers)
-              for (const fCA of feeTiers) {
-                this.progress.pairsTried++;
-                this.progress.perBaseCounts[baseSym]++;
-                this.progress.lastUpdateAt = Date.now();
+            const q2best = await this.bestFeeOut(Bkey, Ckey, q1best.out, searchedPairs);
+            checked += this.cfg.feeTiers.length; if (!q2best) continue;
 
-                // PLANEJADO: +3 quotes
-                this.progress.totalQuotesPlanned += 3;
+            const q3best = await this.bestFeeOut(Ckey, Akey, q2best.out, searchedPairs);
+            checked += this.cfg.feeTiers.length; if (!q3best) continue;
 
-                if (logPairs && searched.length < logPairsMax) {
-                  searched.push(`${A.split("|")[0]}→${B.split("|")[0]}→${C.split("|")[0]}`);
-                }
-
-                try {
-                  this.progress.quotesRequested++;
-                  const q1: any = await (this.gswap as any).quoting.quoteExactInput(
-                    A, B, probeAmount.toString(), fAB
-                  );
-                  const out1 = new BigNumber(q1?.outTokenAmount?.toString?.() ?? q1?.outTokenAmount ?? "0");
-                  this.progress.quotesOk++;
-                  if (out1.isZero()) continue;
-
-                  this.progress.quotesRequested++;
-                  const q2: any = await (this.gswap as any).quoting.quoteExactInput(
-                    B, C, out1.toString(), fBC
-                  );
-                  const out2 = new BigNumber(q2?.outTokenAmount?.toString?.() ?? q2?.outTokenAmount ?? "0");
-                  this.progress.quotesOk++;
-                  if (out2.isZero()) continue;
-
-                  this.progress.quotesRequested++;
-                  const q3: any = await (this.gswap as any).quoting.quoteExactInput(
-                    C, A, out2.toString(), fCA
-                  );
-                  const out3 = new BigNumber(q3?.outTokenAmount?.toString?.() ?? q3?.outTokenAmount ?? "0");
-                  this.progress.quotesOk++;
-
-                  const profitBps = out3.minus(probeAmount).div(probeAmount).multipliedBy(10_000).toNumber();
-                  opps.push({
-                    hops: 3,
-                    tokens: [A, B, C, A],
-                    fees: [fAB, fBC, fCA],
-                    path: `${A.split("|")[0]}->${B.split("|")[0]}->${C.split("|")[0]}->${A.split("|")[0]}`,
-                    profitBps,
-                  });
-                } catch {
-                  this.progress.quotesErr++;
-                }
-              }
+            const pct = q3best.out.minus(probeUsd).div(probeUsd).multipliedBy(100).toNumber();
+            if (this.isProfitable(pct)) {
+              opps.push({
+                path: `${baseSymbol} (fee=${q1best.fee}) → ${B} (fee=${q2best.fee}) → ${C} (fee=${q3best.fee}) → ${baseSymbol}`,
+                tokens: [baseSymbol, B, C, baseSymbol],
+                fees: [q1best.fee, q2best.fee, q3best.fee],
+                hops: 3, pct, inAmt: probeUsd, outAmt: q3best.out
+              });
+            }
+          }
         }
       }
     }
 
-    if (logPairs && searched.length) {
-      const max = Math.min(logPairsMax, searched.length);
-      log("info", `[ARB:searched] ${max}/${searched.length} exemplos (listagem limitada)`);
-      for (let i = 0; i < max; i++) log("info", `  - ${searched[i]}`);
+    opps.sort((a, b) => b.pct - a.pct);
+
+    const elapsed = Date.now() - start;
+    log('info', `[ARB] scan em ${elapsed}ms | rotas≈${checked} | oportunidades=${opps.length}`, this.cfg.logLevel);
+    for (const o of opps.slice(0, 5)) {
+      const s = o.pct >= 0 ? '+' : '';
+      log('info', `[ARB] ${s}${o.pct.toFixed(3)}% | in=${o.inAmt.toFixed(6)} out=${o.outAmt.toFixed(6)} | ${o.path}`, this.cfg.logLevel);
+    }
+    if (opps.length === 0) log('info', `[ARB] nada ≥ ${this.cfg.minProfitBps} bps`, this.cfg.logLevel);
+
+    if (this.cfg.logSearchedPairs) {
+      const pretty = (k: string) => { const [a,b]=k.split('->'); const sym=(s:string)=>s.split('|')[0]; return `${sym(a)}→${sym(b)}`; };
+      const lines:string[]=[];
+      for (const [k,st] of searchedPairs.entries()) {
+        const attempted=[...st.attempted].sort((x,y)=>x-y).join(',');
+        const ok=[...st.okFees].sort((x,y)=>x-y).join(',');
+        lines.push(`${pretty(k)} | tried=[${attempted}] ok=[${ok||'-'}] errors=${st.errors}`);
+      }
+      lines.sort(); const limited=lines.slice(0,this.cfg.logSearchedMax);
+      log('info', `[ARB:searched] pares pesquisados (${lines.length}):`, this.cfg.logLevel);
+      for (const ln of limited) log('info', `  - ${ln}`, this.cfg.logLevel);
+      if (lines.length>limited.length) log('info', `  … +${lines.length-limited.length} pares`, this.cfg.logLevel);
     }
 
-    const finishedAt = Date.now();
-    this.lastReport = {
-      startedAt,
-      finishedAt,
-      durationMs: finishedAt - startedAt,
-      pairsTried: this.progress.pairsTried,
-      quotesRequested: this.progress.quotesRequested,
-      quotesOk: this.progress.quotesOk,
-      quotesErr: this.progress.quotesErr,
-    };
-
     return opps;
+  }
+
+  private async bestFeeOut(
+    tokenInKey: string,
+    tokenOutKey: string,
+    amountIn: BigNumber,
+    searchedPairs: Map<string, PairStats>
+  ): Promise<{ fee: FeeTier; out: BigNumber } | null> {
+    let best: { fee: FeeTier; out: BigNumber } | null = null;
+    for (const fee of this.cfg.feeTiers) {
+      const q = await quoteExactIn(this.gswap, tokenInKey, tokenOutKey, amountIn, searchedPairs, fee);
+      if (!q.ok) continue;
+      if (!best || q.out.gt(best.out)) best = { fee, out: q.out };
+    }
+    return best;
+  }
+
+  private isProfitable(pct: number): boolean {
+    // aceita zero (ou até negativo, se você setar bps negativos)
+    const minPct = this.cfg.minProfitBps / 100; // bps → %
+    return pct >= minPct;
   }
 }

@@ -2,54 +2,10 @@ import BigNumber from 'bignumber.js';
 import { GSwap, GSwapSDKError } from '@gala-chain/gswap-sdk';
 import { Opportunity, FeeTier } from './types.js';
 
-/* -------------------------------------------------------
-   TOKEN ID NORMALIZER
-   Aceita:
-   - Friendly:          "GALA", "GMUSIC"
-   - Especial com $:    "$GMUSIC"          -> $GMUSIC$Unit$none$none
-   - Canônico $:        "GALA$Unit$none$none", "$GMUSIC$Unit$none$none",
-                        "Token$Unit$WEN$client:604161f025e6931a676ccf37"
-   - Pipe |:            "GALA|Unit|none|none", "Token|Unit|WEN|client:..."
-   Retorna SEMPRE o formato PIPE: "Symbol|Class|Sub|Network"
-------------------------------------------------------- */
-function toPipeId(input: string): string {
-  const trimmed = (input || '').trim();
-
-  // Já está em pipe?
-  if (trimmed.includes('|')) return trimmed;
-
-  // Helper para montar canônico $
-  const toDollar = (s: string) => {
-    if (/\$/.test(s)) {
-      // já parece canônico $, ex: GALA$Unit$none$none ou $GMUSIC$Unit$none$none ou Token$Unit$WEN$client:...
-      return s;
-    }
-    // friendly: "GALA" -> GALA$Unit$none$none
-    // friendly especial: "$GMUSIC" -> $GMUSIC$Unit$none$none
-    if (s.startsWith('$')) return `${s}$Unit$none$none`;
-    return `${s}$Unit$none$none`;
-  };
-
-  const dollar = toDollar(trimmed);
-
-  // Parse canônico $  ->  PIPE
-  // Captura símbolo (com ou sem $ na frente), classe, subclasse, network (pode ter ':')
-  const m = dollar.match(/^(\$?[A-Za-z0-9:_-]+)\$(Unit)\$([A-Za-z0-9:_-]+)\$([A-Za-z0-9:_-]+)$/);
-  if (!m) {
-    throw new Error(`Token id inválido: "${input}". Esperado algo como GALA$Unit$none$none, $GMUSIC$Unit$none$none ou Token$Unit$WEN$client:...`);
-  }
-  const symbol = m[1].startsWith('$') ? m[1].slice(1) : m[1]; // tira cifrão da frente se existir
-  const cls = m[2];
-  const sub = m[3];
-  const net = m[4];
-
-  return `${symbol}|${cls}|${sub}|${net}`;
-}
-
 type ExecConfig = {
   enabled: boolean;
   tradeUsd: BigNumber;             // quantidade na moeda base do ciclo
-  maxHopsExec: 2 | 3 | 4 | 5;      // suporta até 5 hops
+  maxHopsExec: 2 | 3;              // 3 = triangular
   maxSlippageBps: number;          // 50 = 0.50% por hop
   cooldownMs: number;
   dedupeWindowMs: number;
@@ -63,16 +19,18 @@ function log(level: 'debug'|'info'|'warn'|'error', msg: string, current: 'debug'
   console.log(`[${new Date().toISOString()}] [${level.toUpperCase()}] ${msg}`);
 }
 
-// FIRE-AND-FORGET entre hops (sem esperar confirmação)
-const WAIT_AFTER_SEND_MS = Number(process.env.WAIT_AFTER_SEND_MS || '2000');
+const toKey = (sym: string) => `${sym}|Unit|none|none`;
+const WAIT_AFTER_SEND_MS = Number(process.env.WAIT_AFTER_SEND_MS || '7000');
 
 function minOut(out: BigNumber, bps: number): string {
   const factor = new BigNumber(1).minus(new BigNumber(bps).div(10_000));
   return out.multipliedBy(factor).toFixed();
 }
+
 function pathHash(tokens: string[], fees: FeeTier[]) {
   return `${tokens.join('>')}|${fees.join(',')}`;
 }
+
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 export class ArbitrageExecutor {
@@ -86,7 +44,7 @@ export class ArbitrageExecutor {
     this.cfg = cfg;
   }
 
-  /** Executa UMA oportunidade (2..5 hops) no modo fire-and-forget. */
+  /** Tenta executar UMA oportunidade (2 ou 3 hops) no modo fire-and-forget. */
   async tryExecute(opp: Opportunity): Promise<boolean> {
     if (!this.cfg.enabled) return false;
     if (opp.hops > this.cfg.maxHopsExec) {
@@ -110,18 +68,12 @@ export class ArbitrageExecutor {
     }
 
     try {
-      // Execução genérica N hops
-      let amount = this.cfg.tradeUsd;
-      for (let i = 0; i < opp.hops; i++) {
-        const tokenIn  = opp.tokens[i];
-        const tokenOut = opp.tokens[i+1];
-        const fee      = opp.fees[i] as FeeTier;
-        amount = await this.executeHop(tokenIn, tokenOut, fee, amount);
+      if (opp.hops === 2)      await this.exec2Hops(opp);
+      else if (opp.hops === 3) await this.exec3Hops(opp);
+      else {
+        log('warn', `[EXEC] hops não suportados: ${opp.hops}`, this.cfg.logLevel);
+        return false;
       }
-
-      const first = this.cfg.tradeUsd;
-      const pct = amount.minus(first).div(first).multipliedBy(100).toNumber();
-      log('info', `[EXEC] ciclo ${opp.path} | lucro≈${pct.toFixed(3)}% (estimado por quotes; sem confirmar tx)`, this.cfg.logLevel);
 
       this.lastExecAt = Date.now();
       this.recentPaths.set(ph, this.lastExecAt);
@@ -139,26 +91,52 @@ export class ArbitrageExecutor {
 
   // ---------- helpers ----------
   private async executeHop(tokenIn: string, tokenOut: string, fee: FeeTier, exactIn: BigNumber) {
-    const Akey = toPipeId(tokenIn);
-    const Bkey = toPipeId(tokenOut);
+    const Akey = toKey(tokenIn), Bkey = toKey(tokenOut);
 
     // 1) quote
     const q: any = await (this.gswap as any).quoting.quoteExactInput(Akey, Bkey, exactIn.toString(), fee);
     const out = new BigNumber(q.outTokenAmount?.toString?.() ?? q.outTokenAmount);
     const min = minOut(out, this.cfg.maxSlippageBps);
-    log('info', `[EXEC] ${Akey.split('|')[0]}->${Bkey.split('|')[0]} fee=${fee} | in=${exactIn.toFixed()} | qOut≈${out.toFixed()} | minOut=${min}`, this.cfg.logLevel);
+    log('info', `[EXEC] ${tokenIn}->${tokenOut} fee=${fee} | in=${exactIn.toFixed()} ${tokenIn} | qOut≈${out.toFixed()} ${tokenOut} | minOut=${min}`, this.cfg.logLevel);
 
-    // 2) swap — FIRE-AND-FORGET
+    // 2) swap (assinatura+envio via SDK) — FIRE AND FORGET
     const pending: any = await (this.gswap as any).swaps.swap(
       Akey, Bkey, fee,
       { exactIn: exactIn.toString(), amountOutMinimum: min },
       undefined
     );
 
+    // logs mínimos de envio
     const txId: string = pending?.txId || pending?.transactionId || pending?.id || 'unknown';
-    log('info', `[EXEC] enviado ${Akey.split('|')[0]}->${Bkey.split('|')[0]} | txId=${txId} | aguardando ${WAIT_AFTER_SEND_MS}ms`, this.cfg.logLevel);
+    log('info', `[EXEC] enviado ${tokenIn}->${tokenOut} | txId=${txId} | aguardando ${WAIT_AFTER_SEND_MS}ms`, this.cfg.logLevel);
+
+    // 3) NÃO espera status — apenas dorme N ms e segue
     await sleep(WAIT_AFTER_SEND_MS);
 
-    return out; // retorno estimado do quote
+    // retornamos o OUT estimado pelo quote (não o saldo real)
+    return out;
+  }
+
+  private async exec2Hops(opp: Opportunity) {
+    const [A,B,_A] = opp.tokens;
+    const [feeAB, feeBA] = opp.fees as [FeeTier, FeeTier];
+
+    const out1 = await this.executeHop(A, B, feeAB, this.cfg.tradeUsd);
+    const out2 = await this.executeHop(B, A, feeBA, out1);
+
+    const pct = out2.minus(this.cfg.tradeUsd).div(this.cfg.tradeUsd).multipliedBy(100).toNumber();
+    log('info', `[EXEC] ciclo 2-hops ${A}->${B}->${A} | lucro≈${pct.toFixed(3)}% (estimado por quotes; sem confirmar tx)`, this.cfg.logLevel);
+  }
+
+  private async exec3Hops(opp: Opportunity) {
+    const [A,B,C,_A] = opp.tokens;
+    const [feeAB, feeBC, feeCA] = opp.fees as [FeeTier, FeeTier, FeeTier];
+
+    const out1 = await this.executeHop(A, B, feeAB, this.cfg.tradeUsd);
+    const out2 = await this.executeHop(B, C, feeBC, out1);
+    const out3 = await this.executeHop(C, A, feeCA, out2);
+
+    const pct = out3.minus(this.cfg.tradeUsd).div(this.cfg.tradeUsd).multipliedBy(100).toNumber();
+    log('info', `[EXEC] ciclo 3-hops ${A}->${B}->${C}->${A} | lucro≈${pct.toFixed(3)}% (estimado por quotes; sem confirmar tx)`, this.cfg.logLevel);
   }
 }
